@@ -34,7 +34,7 @@ class PositionalEmbedding(OptimModule):
         self.seq_len = seq_len
 
         # time embedding
-        t = torch.linspace(0, 1, self.seq_len)[None, :, None] # t : [1, L, 1]
+        t = torch.linspace(0, 1, self.seq_len)[None, :, None] # t : 1, L, 1
 
         # frequency embedding
         # there will be an equal number of cosine and sine components
@@ -80,6 +80,26 @@ class ExponentialModulation(OptimModule):
         decay = torch.exp(-t * self.deltas.abs())
         x = x * decay
         return x
+    
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Normalization.
+
+    This is a simple normalization that normalizes the input by the root mean square of the input.
+    """
+    def __init__(self, d_model, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.hidden_size = d_model
+        self.scale = nn.Parameter(torch.ones(d_model))
+        self.bias = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, x):
+        # calculate the root mean square
+        y = x / (x.norm(2, dim=-1, keepdim=True) * self.hidden_size ** (-1.0 / 2) + self.eps)
+        # apply scale and bias
+        y = y * self.scale + self.bias
+        return y
 
 
 class HyenaFilter(nn.Module):
@@ -131,7 +151,7 @@ class HyenaFilter(nn.Module):
             self.mlp.append(nn.Linear(mlp_order, mlp_order))
             self.mlp.append(act)
         # convert back to embedding dimension
-        self.mlp.append(nn.Linear(mlp_order, emb_dim))
+        self.mlp.append(nn.Linear(mlp_order, d_model))
 
         # exponential modulation
         self.modulation = ExponentialModulation(d_model)
@@ -143,6 +163,7 @@ class HyenaFilter(nn.Module):
         h = self.mlp(z)
         # apply exponential modulation
         h = self.modulation(t, h)
+        return h
 
     def forward(self, x, L, conv_filter=None, bias=None, *args, **kwargs):
         # generate the filter with MLP if not provided
@@ -179,6 +200,8 @@ class HyenaOperator(nn.Module):
         inner_width = d_model * (order + 1)
 
         self.dropout = nn.Dropout(dropout)
+        self.pre_norm = RMSNorm(d_model)
+        self.post_norm = RMSNorm(d_model)
         self.in_proj = nn.Linear(d_model, inner_width)
         self.out_proj = nn.Linear(d_model, d_model)
 
@@ -199,16 +222,18 @@ class HyenaOperator(nn.Module):
         )
 
     def forward(self, u, *args, **kwargs):
-        l = u.shape[-2] # u : b l d
-        l_filter = min(l, self.l_max)
+        L = u.shape[-2] # u : b l d
+        l_filter = min(L, self.l_max)
         
+        # normalize input
+        z = self.pre_norm(u)
         # input projection
-        u = self.in_proj(u)
+        z = self.in_proj(u)
         # reorder dimensions for short filter
-        u = rearrange(u, "b l d -> b d l")
+        z = rearrange(z, "b l d -> b d l")
         
         # apply short filter
-        uc = self.short_filter(u)[...,:l_filter] # uc: b inner_width l_filter
+        uc = self.short_filter(z)[...,:l_filter] # uc: b inner_width l_filter
         # split into chunks of size d_model
         *x, v = uc.split(self.d_model, dim=1) # x_i: b d_model l_filter
 
@@ -216,20 +241,22 @@ class HyenaOperator(nn.Module):
         conv_filter = self.long_filter.filter(l_filter)[0]
         # tweak dimensions for convolution
         conv_filter = rearrange(conv_filter, "l (o d) -> o d l", o=self.order - 1)
-        bias = rearrange(self.bias, "(o d) -> o d", o=self.order - 1)
+        bias = rearrange(self.long_filter.bias, "(o d) -> o d", o=self.order - 1)
 
         # apply hyena recursively
         for o, x_i in enumerate(reversed(x[1:])):
             # Hadamard product
             v = self.dropout(v * x_i)
             # convolution
-            v = self.long_filter(v, l_filter, k=k[o], bias = bias[o])
+            v = self.long_filter(v, l_filter, conv_filter=conv_filter[o], bias = bias[o])
 
         # final Hadamard product
         y = rearrange(v * x[0], "b d l -> b l d")
 
         # project back to input space
-        y = self.out_proj(y)
+        y = self.out_proj(y) + u # residual connection
+        # normalize output
+        y = self.post_norm(y)
 
         return y
 
@@ -242,8 +269,15 @@ if __name__ == "__main__":
         order=2, 
         filter_order=64
     )
+    layer2 = HyenaOperator(
+        d_model=512, 
+        l_max=1024, 
+        order=2, 
+        filter_order=64
+    )
     x = torch.randn(1, 1024, 512, requires_grad=True)
     y = layer(x)
+    y = layer2(y)
         
     print(x.shape, y.shape)
     
