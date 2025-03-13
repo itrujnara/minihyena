@@ -12,6 +12,8 @@ class OptimModule(nn.Module):
             self.register_parameter(name, nn.Parameter(tensor))
 
             optim = {}
-            if lr is not None: optim["lr"] = lr
-            if wd is not None: optim["weight_decay"] = wd
+            if lr is not None:
+                optim["lr"] = lr
+            if wd is not None:
+                optim["weight_decay"] = wd
             setattr(getattr(self, name), "_optim", optim)
