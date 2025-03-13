@@ -1,7 +1,11 @@
 import math
 
+from einops import rearrange
 import torch
 from torch import nn
+
+from functions import fftconv
+from utils import OptimModule
 
 class Sin(nn.Module):
     """
@@ -17,7 +21,7 @@ class Sin(nn.Module):
         return torch.sin(self.freq * x)
 
 
-class PositionalEmbedding(nn.Module):
+class PositionalEmbedding(OptimModule):
     """Positional embedding based on complex exponentials.
 
     The combination of time with multiple cosine and sine frequencies is useful for this model.
@@ -56,12 +60,13 @@ class PositionalEmbedding(nn.Module):
         return self.z[:, :L], self.t[:, :L]
 
 
-class ExponentialModulation(nn.Module):
+class ExponentialModulation(OptimModule):
     """Exponentially decay positions further from the current position.
 
     This increases the importance of close context over distant context.
     """
     def __init__(self, d_model, fast_decay_pct=0.3, slow_decay_pct=1.5, target=1e-2, lr=0.):
+        super().__init__()
         # exponent for the nearest position
         max_decay = math.log(target) / fast_decay_pct
         # exponent for the furthest position
@@ -104,6 +109,9 @@ class HyenaFilter(nn.Module):
         self.emb_dim = emb_dim
         self.seq_len = seq_len
 
+        # activation
+        act = Sin(dim=mlp_order, base_freq=act_freq)
+
         # trainable bias for FFT
         self.bias = nn.Parameter(torch.randn(self.d_model))
         # dropout for training
@@ -120,10 +128,10 @@ class HyenaFilter(nn.Module):
         )
         # apply the hidden layers
         for _ in range(mlp_hidden_layers):
-            self.mlp.append(nn.Linear(order, order))
+            self.mlp.append(nn.Linear(mlp_order, mlp_order))
             self.mlp.append(act)
         # convert back to embedding dimension
-        self.mlp.append(nn.Linear(order, emb_dim))
+        self.mlp.append(nn.Linear(mlp_order, emb_dim))
 
         # exponential modulation
         self.modulation = ExponentialModulation(d_model)
@@ -136,4 +144,110 @@ class HyenaFilter(nn.Module):
         # apply exponential modulation
         h = self.modulation(t, h)
 
+    def forward(self, x, L, conv_filter=None, bias=None, *args, **kwargs):
+        # generate the filter with MLP if not provided
+        if conv_filter is None:
+            conv_filter = self.filter(L)
+
+        # use default bias if not provided
+        if bias is None:
+            bias = self.bias
+        
+        # apply convolution
+        y = fftconv(x, conv_filter, bias, act=False)
+
+        return y
+
+
+class HyenaOperator(nn.Module):
+    """The Hyena operator as defined in the paper."""
+    def __init__(
+            self,
+            d_model,
+            l_max,
+            order=2,
+            filter_order=64,
+            dropout=0.0,
+            filter_dropout=0.0,
+            **kwargs
+        ):
+        super().__init__()
+
+        self.d_model = d_model
+        self.l_max = l_max
+        self.order = order
+        inner_width = d_model * (order + 1)
+
+        self.dropout = nn.Dropout(dropout)
+        self.in_proj = nn.Linear(d_model, inner_width)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.short_filter = nn.Conv1d(
+            inner_width,
+            inner_width,
+            3, # filter size
+            padding=2,
+            groups=inner_width
+        )
+
+        self.long_filter = HyenaFilter(
+            d_model * (order - 1),
+            mlp_order=filter_order,
+            seq_len=l_max,
+            dropout=filter_dropout,
+            **kwargs
+        )
+
+    def forward(self, u, *args, **kwargs):
+        l = u.shape[-2] # u : b l d
+        l_filter = min(l, self.l_max)
+        
+        # input projection
+        u = self.in_proj(u)
+        # reorder dimensions for short filter
+        u = rearrange(u, "b l d -> b d l")
+        
+        # apply short filter
+        uc = self.short_filter(u)[...,:l_filter] # uc: b inner_width l_filter
+        # split into chunks of size d_model
+        *x, v = uc.split(self.d_model, dim=1) # x_i: b d_model l_filter
+
+        # generate long convolution filter
+        conv_filter = self.long_filter.filter(l_filter)[0]
+        # tweak dimensions for convolution
+        conv_filter = rearrange(conv_filter, "l (o d) -> o d l", o=self.order - 1)
+        bias = rearrange(self.bias, "(o d) -> o d", o=self.order - 1)
+
+        # apply hyena recursively
+        for o, x_i in enumerate(reversed(x[1:])):
+            # Hadamard product
+            v = self.dropout(v * x_i)
+            # convolution
+            v = self.long_filter(v, l_filter, k=k[o], bias = bias[o])
+
+        # final Hadamard product
+        y = rearrange(v * x[0], "b d l -> b l d")
+
+        # project back to input space
+        y = self.out_proj(y)
+
+        return y
+
+
+# code to test that the implementation works
+if __name__ == "__main__":
+    layer = HyenaOperator(
+        d_model=512, 
+        l_max=1024, 
+        order=2, 
+        filter_order=64
+    )
+    x = torch.randn(1, 1024, 512, requires_grad=True)
+    y = layer(x)
+        
+    print(x.shape, y.shape)
+    
+    grad = torch.autograd.grad(y[:, 10, :].sum(), x)[0]
+    print('Causality check: gradients should not flow "from future to past"')
+    print(grad[0, 11, :].sum(), grad[0, 9, :].sum())
 
