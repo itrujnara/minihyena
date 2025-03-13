@@ -16,7 +16,7 @@ def fftconv(u, filter, bias, act=True):
     # apply the convolution by multiplying and IFFT
     # we need to remove padding afterwards
     u_filter = u_fourier * filter_fourier
-    y = torch.fft.irfft(u_filter, n=fft_size, norm="forward")
+    y = torch.fft.irfft(u_filter, n=fft_size, norm="forward")[..., :u.shape[-1]]
 
     # apply bias
     out = y + u * bias.unsqueeze(1)
