@@ -3,6 +3,7 @@ import math
 from einops import rearrange
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from functions import fftconv
 from utils import OptimModule
@@ -99,6 +100,22 @@ class RMSNorm(nn.Module):
         y = x / (x.norm(2, dim=-1, keepdim=True) * self.hidden_size ** (-1.0 / 2) + self.eps)
         # apply scale and bias
         y = y * self.scale + self.bias
+        return y
+    
+
+class GatedMLP(nn.Module):
+    """Gated MLP module."""
+    def __init__(self, d_model, mlp_hidden_dim):
+        super().__init__()
+        self.l1 = nn.Linear(d_model, mlp_hidden_dim, bias=False)
+        self.l2 = nn.Linear(d_model, mlp_hidden_dim, bias=False)
+        self.l3 = nn.Linear(mlp_hidden_dim, d_model, bias=False)
+        self.act = F.silu
+
+    def forward(self, x):
+        z1 = self.l1(x)
+        z2 = self.l2(x)
+        y = self.l3(self.act(z1) * z2)
         return y
 
 
