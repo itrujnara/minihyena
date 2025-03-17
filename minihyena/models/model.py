@@ -1,8 +1,12 @@
+from typing import Callable, Optional
+
+from einops import rearrange
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from components import HyenaOperator, RMSNorm, GatedMLP
+from tokenizer import AsciiTokenizer
 
 
 class AttentionBlock(nn.Module):
@@ -69,28 +73,66 @@ class MiniHyena(nn.Module):
         y = y @ self.embedding.weight.T
 
         return y
+    
+    def compute_loss(self, output: torch.Tensor, target: torch.Tensor, loss_fn: Callable):
+        output_reshaped = rearrange(output, 'b L d -> b d L')
+        loss = loss_fn(output_reshaped, target)
+        return loss
+    
+    def batch(
+            self,
+            x: dict,
+            y: dict,
+            loss_fn: Callable,
+            optimizer: Optional[Callable] = None,
+    ):
+        tokens = x["input"]
+        in_tokens = tokens[:, :-1]
+        out_tokens = tokens[:, 1:]
+        output = self(in_tokens)
+        loss = self.compute_loss(output, out_tokens, loss_fn)
+
+        if optimizer is not None:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        return loss, output
             
     
 
 if __name__ == "__main__":
-    # make some input
-    x = torch.randn(4, 1024, 512)
-    print(f"Input shape: {x.shape}")
+    # create the input
+    sentence = "According to all known laws of aviation"
+    print(sentence)
 
-    # test the AttentionBlock
-    attention = AttentionBlock(512)
-    y = attention(x)
-    print(f"Attention output shape: {y.shape}")
+    tokenizer = AsciiTokenizer()
+    tokens = tokenizer.tokenize(sentence)
+    tokens = torch.tensor(tokens).repeat(10, 1).to(torch.int64)
+    print(tokens.shape)
 
-    # test the HyenaBlock
-    hyena = HyenaBlock(512, 1024)
-    z = hyena(x)
-    print(f"Hyena output shape: {z.shape}")
+    # create the model
+    model = MiniHyena(d_model=512, l_max=128, vocab_size=512, blocks="ah")
 
-    # test the MiniHyena
-    tokens = torch.randint(0, 512, (4, 1024))
-    model = MiniHyena(512, 1024, 512, "hah")
-    y = model(tokens)
-    print(f"Tokens shape: {tokens.shape}")
-    print(f"MiniHyena output shape: {y.shape}")
-    print(f"MiniHyena sample output: {y[0, -1, :]}")
+    # run the model
+    x = {"input": tokens}
+    y = dict()
+    loss_fn = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    n_epochs = 10
+    for epoch in range(n_epochs):
+        loss, output = model.batch(x, y, loss_fn, optimizer)
+        print(f"Epoch {epoch+1}/{n_epochs} - Loss: {loss.item()}")
+    # print(output.shape)
+    # print(output[0])
+    # print(output[0].argmax(dim=-1))
+    # print(tokenizer.detokenize(output[0].argmax(dim=-1)))
+    test_sentence = "known laws of avi"
+    test_tokens = tokenizer.tokenize(test_sentence)
+    test_tokens = torch.tensor(test_tokens).unsqueeze(0).to(torch.int64)
+    test_output = model(test_tokens)
+    print(test_output.shape)
+    print(test_output[0])
+    print(test_output[0].argmax(dim=-1))
+    print(tokenizer.detokenize(test_output[0].argmax(dim=-1)))
+    
