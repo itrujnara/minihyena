@@ -469,7 +469,7 @@ class HyenaBlock(nn.Module):
         return y
     
 
-class MiniHyena(nn.Module):
+class ModelMiniHyena(nn.Module):
     """A simplified version of StripedHyena."""
     def __init__(self, d_model, l_max, vocab_size, blocks):
         super().__init__()
@@ -536,7 +536,7 @@ if __name__ == "__main__":
     print(tokens.shape)
 
     # create the model
-    model = MiniHyena(d_model=512, l_max=128, vocab_size=512, blocks="ah")
+    model = ModelMiniHyena(d_model=512, l_max=128, vocab_size=512, blocks="ah")
 
     output = model(tokens)
     print(output.shape)
