@@ -294,6 +294,97 @@ class HyenaOperator(nn.Module):
             **kwargs
         )
 
+    def forward(self, u, padding_mask=None):
+        L = u.shape[-2] # u : b l d
+        l_filter = min(L, self.l_max)
+        
+        # normalize input
+        z = self.pre_norm(u)
+        # input projection
+        z = self.in_proj(u)
+
+        # apply padding mask
+        if padding_mask is not None:
+            z = z * padding_mask[...,None]
+
+        # reorder dimensions for short filter
+        z = rearrange(z, "b l d -> b d l")
+        
+        # apply short filter
+        uc = self.short_filter(z)[...,:l_filter] # uc: b inner_width l_filter
+        # split into chunks of size d_model
+        *x, v = uc.split(self.d_model, dim=1) # x_i: b d_model l_filter
+
+        # generate long convolution filter
+        conv_filter = self.long_filter.filter(l_filter)[0]
+        # tweak dimensions for convolution
+        conv_filter = rearrange(conv_filter, "l (o d) -> o d l", o=self.order - 1)
+        bias = rearrange(self.long_filter.bias, "(o d) -> o d", o=self.order - 1)
+
+        # apply hyena recursively
+        for o, x_i in enumerate(reversed(x[1:])):
+            # Hadamard product
+            v = self.dropout(v * x_i)
+            # convolution
+            v = self.long_filter(v, l_filter, conv_filter=conv_filter[o], bias = bias[o])
+
+        # final Hadamard product
+        y = rearrange(v * x[0], "b d l -> b l d")
+
+        # project back to input space
+        y = self.out_proj(y) + u # residual connection
+
+        # apply padding mask
+        if padding_mask is not None:
+            y = y * padding_mask[...,None]
+
+        # normalize output
+        y = self.post_norm(y)
+
+        return y
+
+
+class HyenaOperator(nn.Module):
+    """The Hyena operator as defined in the paper."""
+    def __init__(
+            self,
+            d_model,
+            l_max,
+            order=2,
+            filter_order=64,
+            dropout=0.0,
+            filter_dropout=0.0,
+            **kwargs
+        ):
+        super().__init__()
+
+        self.d_model = d_model
+        self.l_max = l_max
+        self.order = order
+        inner_width = d_model * (order + 1)
+
+        self.dropout = nn.Dropout(dropout)
+        self.pre_norm = RMSNorm(d_model)
+        self.post_norm = RMSNorm(d_model)
+        self.in_proj = nn.Linear(d_model, inner_width)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.short_filter = nn.Conv1d(
+            inner_width,
+            inner_width,
+            3, # filter size
+            padding=2,
+            groups=inner_width
+        )
+
+        self.long_filter = HyenaFilter(
+            d_model * (order - 1),
+            mlp_order=filter_order,
+            seq_len=l_max,
+            dropout=filter_dropout,
+            **kwargs
+        )
+
     def forward(self, u, *args, **kwargs):
         L = u.shape[-2] # u : b l d
         l_filter = min(L, self.l_max)
@@ -344,11 +435,20 @@ class AttentionBlock(nn.Module):
         self.mha = nn.MultiheadAttention(d_model, num_heads=8, **kwargs)
         self.mlp = GatedMLP(d_model, d_model * 2)
 
-    def forward(self, x):
+    def forward(self, x, padding_mask=None):
+        if padding_mask is not None:
+            x = x * padding_mask[..., None]
+
         u = self.pre_norm(x)
+
         y, _ = self.mha(u, u, u)
         y = y + u
+
+        if padding_mask is not None:
+            y = y * padding_mask[..., None]
+
         y = self.post_norm(y)
+
         y = self.mlp(y) + y
 
         return y
@@ -362,8 +462,8 @@ class HyenaBlock(nn.Module):
         self.operator = HyenaOperator(d_model, l_max, order, **kwargs)
         self.activation = F.gelu
 
-    def forward(self, x):
-        y = self.operator(x)
+    def forward(self, x, padding_mask=None):
+        y = self.operator(x, padding_mask=padding_mask)
         y = self.activation(y)
 
         return y
@@ -377,7 +477,7 @@ class MiniHyena(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.norm = RMSNorm(d_model)
 
-        self.blocks = nn.Sequential()
+        self.blocks = nn.ModuleList()
 
         for i in blocks:
             if i == 'a':
@@ -387,10 +487,11 @@ class MiniHyena(nn.Module):
             else:
                 raise ValueError(f"Invalid block type: {i}")
             
-    def forward(self, x):
+    def forward(self, x, padding_mask=None):
         y = self.embedding(x)
 
-        y = self.blocks(y)
+        for block in self.blocks:
+            y = block(y, padding_mask=padding_mask)
 
         y = self.norm(y)
 

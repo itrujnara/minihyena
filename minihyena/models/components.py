@@ -238,7 +238,7 @@ class HyenaOperator(nn.Module):
             **kwargs
         )
 
-    def forward(self, u, *args, **kwargs):
+    def forward(self, u, padding_mask=None):
         L = u.shape[-2] # u : b l d
         l_filter = min(L, self.l_max)
         
@@ -246,6 +246,11 @@ class HyenaOperator(nn.Module):
         z = self.pre_norm(u)
         # input projection
         z = self.in_proj(u)
+
+        # apply padding mask
+        if padding_mask is not None:
+            z = z * padding_mask[...,None]
+
         # reorder dimensions for short filter
         z = rearrange(z, "b l d -> b d l")
         
@@ -272,6 +277,11 @@ class HyenaOperator(nn.Module):
 
         # project back to input space
         y = self.out_proj(y) + u # residual connection
+
+        # apply padding mask
+        if padding_mask is not None:
+            y = y * padding_mask[...,None]
+
         # normalize output
         y = self.post_norm(y)
 

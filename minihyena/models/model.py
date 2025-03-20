@@ -19,11 +19,20 @@ class AttentionBlock(nn.Module):
         self.mha = nn.MultiheadAttention(d_model, num_heads=8, **kwargs)
         self.mlp = GatedMLP(d_model, d_model * 2)
 
-    def forward(self, x):
+    def forward(self, x, padding_mask=None):
+        if padding_mask is not None:
+            x = x * padding_mask[..., None]
+
         u = self.pre_norm(x)
+
         y, _ = self.mha(u, u, u)
         y = y + u
+
+        if padding_mask is not None:
+            y = y * padding_mask[..., None]
+
         y = self.post_norm(y)
+
         y = self.mlp(y) + y
 
         return y
@@ -37,8 +46,8 @@ class HyenaBlock(nn.Module):
         self.operator = HyenaOperator(d_model, l_max, order, **kwargs)
         self.activation = F.gelu
 
-    def forward(self, x):
-        y = self.operator(x)
+    def forward(self, x, padding_mask=None):
+        y = self.operator(x, padding_mask=padding_mask)
         y = self.activation(y)
 
         return y
@@ -52,7 +61,7 @@ class MiniHyena(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.norm = RMSNorm(d_model)
 
-        self.blocks = nn.Sequential()
+        self.blocks = nn.ModuleList()
 
         for i in blocks:
             if i == 'a':
@@ -62,10 +71,11 @@ class MiniHyena(nn.Module):
             else:
                 raise ValueError(f"Invalid block type: {i}")
             
-    def forward(self, x):
+    def forward(self, x, padding_mask=None):
         y = self.embedding(x)
 
-        y = self.blocks(y)
+        for block in self.blocks:
+            y = block(y, padding_mask=padding_mask)
 
         y = self.norm(y)
 
@@ -108,31 +118,18 @@ if __name__ == "__main__":
 
     tokenizer = AsciiTokenizer()
     tokens = tokenizer.tokenize(sentence)
-    tokens = torch.tensor(tokens).repeat(10, 1).to(torch.int64)
+    tokens = torch.tensor(tokens).unsqueeze(0).to(torch.int64)
     print(tokens.shape)
 
     # create the model
     model = MiniHyena(d_model=512, l_max=128, vocab_size=512, blocks="ah")
 
     # run the model
-    x = {"input": tokens}
-    y = dict()
-    loss_fn = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    n_epochs = 10
-    for epoch in range(n_epochs):
-        loss, output = model.batch(x, y, loss_fn, optimizer)
-        print(f"Epoch {epoch+1}/{n_epochs} - Loss: {loss.item()}")
-    # print(output.shape)
-    # print(output[0])
-    # print(output[0].argmax(dim=-1))
-    # print(tokenizer.detokenize(output[0].argmax(dim=-1)))
-    test_sentence = "known laws of avi"
-    test_tokens = tokenizer.tokenize(test_sentence)
-    test_tokens = torch.tensor(test_tokens).unsqueeze(0).to(torch.int64)
-    test_output = model(test_tokens)
-    print(test_output.shape)
-    print(test_output[0])
-    print(test_output[0].argmax(dim=-1))
-    print(tokenizer.detokenize(test_output[0].argmax(dim=-1)))
+    x = torch.cat((torch.zeros(1, 5), tokens), dim=1).to(torch.int64)
+    print(x)
+    padding_mask = torch.cat((torch.zeros(1, 5), torch.ones_like(tokens)), dim=1)
+    print(padding_mask)
+    y = model(x, padding_mask).detach()
+    print(y.shape)
+    print(y)
     
